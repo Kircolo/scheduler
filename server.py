@@ -4,6 +4,8 @@ import threading
 import csv
 import json
 import io
+import os
+import logging
 from _thread import LockType
 from typing import Dict, Optional, List, Any
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File, Body
@@ -17,6 +19,120 @@ from scheduler import Scheduler, Job
 # Startup
 # -------------------------
 
+logger = logging.getLogger(__name__)
+
+class ConfigError(ValueError):
+    """Raised when startup configuration is invalid."""
+
+
+def _default_capacity_and_quotas() -> tuple[Dict[str, int], Dict[str, Dict[str, int]]]:
+    # Keep defaults small and obvious for interview/demo purposes.
+    capacity = {"A100": 4, "H100": 2}
+    tenant_quotas = {
+        "t1": {"A100": 2, "H100": 1},
+        "t2": {"A100": 2, "H100": 1},
+    }
+    return capacity, tenant_quotas
+
+
+def _load_json_env(var_name: str) -> Optional[dict]:
+    raw = os.getenv(var_name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        raise ConfigError(f"{var_name} is set but empty")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{var_name} contains invalid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise ConfigError(f"{var_name} must be a JSON object (dict)")
+    return obj
+
+
+def _validate_capacity(capacity: dict) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for gpu_type, count in capacity.items():
+        if not isinstance(gpu_type, str) or not gpu_type.strip():
+            raise ConfigError("capacity keys must be non-empty strings")
+
+        # bool is a subclass of int, so guard it explicitly
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise ConfigError(f"capacity[{gpu_type!r}] must be an int")
+        if count <= 0:
+            raise ConfigError(f"capacity[{gpu_type!r}] must be > 0")
+
+        out[gpu_type] = count
+
+    if not out:
+        raise ConfigError("capacity must not be empty")
+
+    return out
+
+
+def _validate_tenant_quotas(tenant_quotas: dict, capacity_keys: set[str]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+
+    for tenant_id, quotas in tenant_quotas.items():
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ConfigError("tenant_quotas keys must be non-empty strings (tenant_id)")
+        if not isinstance(quotas, dict):
+            raise ConfigError(f"tenant_quotas[{tenant_id!r}] must be a JSON object (dict)")
+
+        clean: Dict[str, int] = {}
+        for gpu_type, limit in quotas.items():
+            if not isinstance(gpu_type, str) or not gpu_type.strip():
+                raise ConfigError(f"tenant_quotas[{tenant_id!r}] has a non-string gpu_type key")
+            if gpu_type not in capacity_keys:
+                raise ConfigError(
+                    f"tenant_quotas[{tenant_id!r}] references unknown gpu_type {gpu_type!r} (not in capacity)"
+                )
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise ConfigError(f"tenant_quotas[{tenant_id!r}][{gpu_type!r}] must be an int")
+            if limit < 0:
+                raise ConfigError(f"tenant_quotas[{tenant_id!r}][{gpu_type!r}] must be >= 0")
+
+            clean[gpu_type] = limit
+
+        out[tenant_id] = clean
+
+    if not out:
+        raise ConfigError("tenant_quotas must not be empty")
+
+    return out
+
+
+def _build_scheduler_from_env_or_default() -> Scheduler:
+    """
+    Build Scheduler config from environment (fail-fast on invalid config).
+
+    Env vars (optional):
+      - SCHEDULER_CAPACITY_JSON: JSON object like {"A100": 4, "H100": 2}
+      - SCHEDULER_TENANT_QUOTAS_JSON: JSON object like {"t1": {"A100": 2}}
+    """
+    capacity, tenant_quotas = _default_capacity_and_quotas()
+
+    cap_obj = _load_json_env("SCHEDULER_CAPACITY_JSON")
+    if cap_obj is not None:
+        capacity = _validate_capacity(cap_obj)
+    else:
+        capacity = _validate_capacity(capacity)
+
+    quotas_obj = _load_json_env("SCHEDULER_TENANT_QUOTAS_JSON")
+    if quotas_obj is not None:
+        tenant_quotas = _validate_tenant_quotas(quotas_obj, set(capacity))
+    else:
+        # Validate defaults against the final capacity (in case capacity was overridden).
+        tenant_quotas = _validate_tenant_quotas(tenant_quotas, set(capacity))
+
+    logger.info(
+        "Scheduler config loaded (gpu_types=%s tenants=%d)",
+        sorted(capacity.keys()),
+        len(tenant_quotas),
+    )
+    return Scheduler(capacity=capacity, tenant_quotas=tenant_quotas)
+
 # build a basic "default" Scheduler [hardcoded]
 def _build_default_scheduler() -> Scheduler:
     capacity = {"A100": 4, "H100": 2}
@@ -26,18 +142,23 @@ def _build_default_scheduler() -> Scheduler:
     }
     return Scheduler(capacity=capacity, tenant_quotas=tenant_quotas)
 
-# FastAPI calls this once on startup and shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI calls this once at startup, then again at shutdown.
-
-    We use it to:
+    Startup responsibilities:
     - create a single Scheduler instance (in-memory)
     - create a Lock to protect it from concurrent requests
+
+    Fail-fast philosophy:
+    - If config is invalid or scheduler initialization fails, raise and crash on startup.
     """
-    app.state.lock = threading.Lock()
-    app.state.scheduler = _build_default_scheduler()
+    try:
+        app.state.lock = threading.Lock()
+        app.state.scheduler = _build_scheduler_from_env_or_default()
+    except Exception:
+        logger.exception("Startup failed")
+        raise
+
     yield
 
 app = FastAPI(
