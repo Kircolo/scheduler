@@ -1,70 +1,211 @@
-# DigitalOcean-Style 3-Hour Mock: Quota-Aware GPU Job Scheduler (Core + Optional Service Layer)
+# Quota-Aware GPU Job Scheduler (Core + FastAPI Service)
 
-You are building the core of a small “job submission + scheduling” service used by a multi-tenant GPU platform.
+A small, in-memory **job submission + scheduling** service for a **multi-tenant GPU platform**.
 
-## Constraints
-- **Python 3.x**
-- **Standard library only** (no FastAPI/Flask/pytest)
-- **Do not mutate input Job objects**
-- Your implementation should be clear enough to walk through in a code review.
+- **Core scheduler**: quota-aware scheduling with **aging-based fairness**
+- **Service layer**: a minimal **FastAPI** REST API for submitting, scheduling, completing, ingesting, and inspecting jobs
 
-## Core Concepts
-- The system has **global GPU capacity per GPU type** (e.g., A100, H100).
-- Each tenant has a **quota per GPU type**.
-- Jobs request a GPU type and a number of GPUs (`gpus`).
-- Jobs move through states: `WAITING -> RUNNING -> COMPLETED`.
+---
 
-## Required Behavior
-### 1) Submitting jobs
-- `submit(job)` adds a job to the WAITING queue.
-- Duplicate `job_id` must raise `ValueError`.
+## Project layout
 
-### 2) Scheduling jobs
-- `schedule(now)` starts as many jobs as possible (and returns the list of `job_id`s started in **this** call).
-- A job can start only if:
-  - There is enough **global remaining capacity** for its `gpu_type`, and
-  - The tenant has enough **remaining quota** for its `gpu_type`.
-- **Selection rule (highest first):**
-  1. Higher **effective priority** wins.
-  2. If tied, earlier `submitted_at` wins.
-  3. If tied, lexicographically smaller `job_id` wins.
+- `scheduler.py` — core scheduling logic
+- `server.py` — FastAPI app exposing scheduler operations
+- `tests/` — unit + API tests (unittest)
+- `Makefile` — repeatable commands (run/test/smoke/ci)
+- `.github/workflows/ci.yml` — GitHub Actions CI
 
-#### Effective priority (aging / fairness)
+---
+
+## Core concepts
+
+- Global **GPU capacity per type**
+- Per-tenant **quota per GPU type**
+- Jobs request:
+  - `gpu_type` (string)
+  - `gpus` (int > 0)
+- States:
+  - `WAITING -> RUNNING -> COMPLETED`
+
+### Scheduling rule (priority + aging)
 To avoid starvation, jobs gain priority the longer they wait:
 
 ```
 effective_priority = priority + (now - submitted_at) // AGING_SECONDS
 ```
 
-Use `AGING_SECONDS = 60`.
+`AGING_SECONDS = 60`.
 
-### 3) Completing jobs
-- `complete(job_id)` marks a RUNNING job as COMPLETED and frees its resources.
-- Completing a job that is not RUNNING must raise `ValueError`.
-- Completing an unknown job must raise `KeyError`.
+Selection order within a GPU type:
+1. Higher **effective priority** first
+2. Earlier `submitted_at` first
+3. Lexicographically smaller `job_id` first
 
-### 4) Status / visibility helpers
-- `status(job_id)` returns one of: `"WAITING"`, `"RUNNING"`, `"COMPLETED"`.
-  - Unknown job_id should raise `KeyError`.
-- `running()` returns the list of running job_ids (sorted by `started_at`, then `job_id`).
-- `waiting()` returns the number of waiting jobs.
+---
 
-## Optional “Service Layer” (Stretch)
-If you finish early, implement a minimal JSON HTTP interface using `http.server`:
+## API overview (FastAPI)
 
-- `POST /jobs` -> submit job
-- `POST /jobs/<id>/complete` -> complete
-- `POST /schedule?now=123` -> schedule
-- `GET /jobs/<id>` -> status
+The service exposes these endpoints:
 
-Keep the scheduling logic in `scheduler.py` and make the HTTP layer thin.
+- `GET /healthz` → health check
+- `POST /jobs` → submit a single job (201 on success)
+- `POST /jobs/batch` → submit a list of jobs (partial success)
+- `POST /ingest?fmt=ndjson|csv` → ingest jobs from uploaded file (partial success)
+- `POST /schedule?now=<int>` → run one scheduling “tick”
+- `POST /jobs/{job_id}/complete` → complete a RUNNING job
+- `GET /jobs/{job_id}` → get job status
+- `GET /stats` → scheduler state snapshot
 
-## How to run tests
-From this folder:
+### Default capacity + quotas
+On startup, `server.py` initializes an in-memory scheduler with:
 
+- Capacity: `A100=4`, `H100=2`
+- Tenant quotas:
+  - `t1`: `A100=2`, `H100=1`
+  - `t2`: `A100=2`, `H100=1`
+
+---
+
+## Error responses (consistent shape)
+
+All error responses use:
+
+```json
+{
+  "error": {
+    "code": "SOME_CODE",
+    "message": "Human-readable message",
+    "details": []
+  }
+}
 ```
-python -m unittest -v
+
+Common codes:
+- `VALIDATION_ERROR` (422) — request payload/query validation failed
+- `DUPLICATE_JOB` (409) — job_id already exists
+- `JOB_NOT_FOUND` (404) — unknown job_id
+- `INVALID_STATE` (400) — completing a job that isn’t RUNNING
+- `BAD_FORMAT` (400) — ingest `fmt` not in `ndjson|csv`
+- `BAD_ENCODING` (400) — ingest file not UTF-8
+- `SERVICE_NOT_READY` (503) — scheduler/lock not initialized
+
+---
+
+## How to run locally
+
+### 1) Create a virtual environment + install deps
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Deliverable
-Implement `scheduler.py` so all tests pass in `tests/test_scheduler.py`.
+Or, if you’re using the Makefile:
+
+```bash
+make install
+```
+
+### 2) Run tests
+
+```bash
+make test
+```
+
+(Equivalent: `python -m unittest discover -v -s . -p "test_*.py"`)
+
+### 3) Run the API server
+
+```bash
+make run
+```
+
+(Equivalent: `python -m uvicorn server:app --host 0.0.0.0 --port 8000`)
+
+### 4) Smoke test (start server + hit HTTP endpoints)
+
+```bash
+make smoke
+```
+
+---
+
+## API examples (curl)
+
+### Health check
+```bash
+curl -s http://127.0.0.1:8000/healthz
+```
+
+### Submit a job
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_id":"j1",
+    "tenant_id":"t1",
+    "gpu_type":"A100",
+    "gpus":1,
+    "priority":5,
+    "submitted_at":0
+  }'
+```
+
+### Schedule (tick)
+```bash
+curl -s -X POST "http://127.0.0.1:8000/schedule?now=120"
+```
+
+### Complete a job
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs/j1/complete
+```
+
+### Stats
+```bash
+curl -s http://127.0.0.1:8000/stats
+```
+
+### Batch submit
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs/batch \
+  -H "Content-Type: application/json" \
+  -d '[
+    {"job_id":"b1","tenant_id":"t1","gpu_type":"A100","gpus":1,"priority":1,"submitted_at":0},
+    {"job_id":"b2","tenant_id":"t2","gpu_type":"H100","gpus":1,"priority":9,"submitted_at":0}
+  ]'
+```
+
+### Ingest jobs (NDJSON)
+`fmt=ndjson` expects **one JSON object per line**.
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/ingest?fmt=ndjson" \
+  -F "file=@jobs.ndjson"
+```
+
+### Ingest jobs (CSV)
+`fmt=csv` expects a header row with fields like:
+`job_id,tenant_id,gpu_type,gpus,priority,submitted_at[,max_runtime]`
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/ingest?fmt=csv" \
+  -F "file=@jobs.csv"
+```
+
+---
+
+## CI (GitHub Actions)
+
+A minimal CI workflow lives at `.github/workflows/ci.yml` and runs the same commands you run locally:
+- install deps from `requirements.txt`
+- run `make test`
+- optionally run `make smoke` (real server startup + HTTP checks)
+
+---
+
+## Notes
+
+- The scheduler is in-memory (no persistence).
+- The API layer uses a single lock to serialize access to scheduler state for thread safety.
