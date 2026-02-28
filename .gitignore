@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Local files
+.DS_Store
+
+# Test/coverage artifacts (optional)
+.coverage
+htmlcov/
