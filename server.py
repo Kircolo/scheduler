@@ -5,6 +5,8 @@ import csv
 import json
 import io
 import os
+import time
+import uuid
 import logging
 from _thread import LockType
 from typing import Dict, Optional, List, Any
@@ -20,6 +22,8 @@ from scheduler import Scheduler, Job
 # -------------------------
 
 logger = logging.getLogger(__name__)
+
+# default values
 
 class ConfigError(ValueError):
     """Raised when startup configuration is invalid."""
@@ -133,6 +137,29 @@ def _build_scheduler_from_env_or_default() -> Scheduler:
     )
     return Scheduler(capacity=capacity, tenant_quotas=tenant_quotas)
 
+# LOGGING
+
+def _new_request_id() -> str:
+    return uuid.uuid4().hex
+
+def _set_log_fields(request: Request, **fields: Any) -> None:
+    """
+    Stash handler-specific fields (job_id, tenant_id, result, etc.)
+    so the middleware can include them in the final request log.
+    """
+    lf = getattr(request.state, "log_fields", None)
+    if lf is None:
+        lf = {}
+        request.state.log_fields = lf
+    for k, v in fields.items():
+        if v is not None:
+            lf[k] = v
+
+
+def _log_json(level: int, event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    logger.log(level, json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
+
 # build a basic "default" Scheduler [hardcoded]
 def _build_default_scheduler() -> Scheduler:
     capacity = {"A100": 4, "H100": 2}
@@ -166,6 +193,47 @@ app = FastAPI(
     version="1.0",
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or _new_request_id()
+    request.state.request_id = request_id
+    request.state.log_fields = {}  # handler will populate this
+
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        _log_json(
+            logging.ERROR,
+            "request_failed",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            latency_ms=round(latency_ms, 3),
+            error_type=type(e).__name__,
+            error=str(e),
+            **getattr(request.state, "log_fields", {}),
+        )
+        raise
+
+    latency_ms = (time.perf_counter() - start) * 1000.0
+
+    # Always echo request id back to clients for correlation
+    response.headers["X-Request-ID"] = request_id
+
+    _log_json(
+        logging.INFO,
+        "request_done",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        latency_ms=round(latency_ms, 3),
+        **getattr(request.state, "log_fields", {}),
+    )
+    return response
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -273,7 +341,7 @@ def healthz() -> Dict[str, bool]:
 
 # API version of Scheduler.submit(job). Code 201 Created
 @app.post("/jobs", response_model=SubmitResp, status_code=201)
-def submit_job(job: JobIn) -> SubmitResp:
+def submit_job(job: JobIn, request: Request) -> SubmitResp:
     """
     POST /jobs
     Body: JobIn JSON
@@ -282,6 +350,14 @@ def submit_job(job: JobIn) -> SubmitResp:
     Error mapping:
     - duplicate job_id -> 409 Conflict (scheduler.submit raises ValueError)
     """
+    _set_log_fields(
+        request,
+        job_id=job.job_id,
+        tenant_id=job.tenant_id,
+        gpu_type=job.gpu_type,
+        result="attempt_submit",
+    )
+
     s = _get_scheduler()
     lock = _get_lock()
     
@@ -293,9 +369,11 @@ def submit_job(job: JobIn) -> SubmitResp:
             s.submit(job_obj)
         except ValueError as e:
             # duplicate job
+            _set_log_fields(request, result="DUPLICATE_JOB")
             api_error(409, "DUPLICATE_JOB", str(e))
     
         # worked
+        _set_log_fields(request, result="OK")
         return SubmitResp(job_id=job_obj.job_id, status=s.status(job_obj.job_id))
     
 @app.post("/jobs/batch")
@@ -444,7 +522,7 @@ def ingest(
     
 # run schedule() & return ids of jobs started
 @app.post("/schedule", response_model=ScheduleResp)
-def schedule(now: int = Query(..., description="Integer timestamp used for aging-based fairness (effective priority).")) -> ScheduleResp:
+def schedule(request: Request, now: int = Query(..., description="Integer timestamp used for aging-based fairness (effective priority).")) -> ScheduleResp:
     """
     POST /schedule?now=123
     Effect: starts as many jobs as possible and returns which started
@@ -454,11 +532,21 @@ def schedule(now: int = Query(..., description="Integer timestamp used for aging
 
     with lock:
         started = s.schedule(now)
-        return ScheduleResp(started=started, running=s.running(), waiting=s.waiting())
+        running = s.running()
+        waiting = s.waiting()
+
+    _set_log_fields(
+        request,
+        result="OK",
+        started_count=len(started),
+        running_count=len(running),
+        waiting=waiting,
+    )
+    return ScheduleResp(started=started, running=running, waiting=waiting)
     
 # mark job_id complete
 @app.post("/jobs/{job_id}/complete")
-def complete_job(job_id: str) -> Dict[str, str]:
+def complete_job(job_id: str, request: Request) -> Dict[str, str]:
     """
     POST /jobs/<job_id>/complete
     Effect: marks a RUNNING job as COMPLETED and frees resources
@@ -467,6 +555,7 @@ def complete_job(job_id: str) -> Dict[str, str]:
     - unknown job_id -> 404 Not Found (scheduler.complete raises KeyError)
     - job not RUNNING -> 400 Bad Request (scheduler.complete raises ValueError)
     """
+    _set_log_fields(request, job_id=job_id, result="attempt_complete")
 
     s = _get_scheduler()
     lock = _get_lock()
@@ -475,11 +564,14 @@ def complete_job(job_id: str) -> Dict[str, str]:
         try:
             s.complete(job_id)
         except KeyError:
+            _set_log_fields(request, result="JOB_NOT_FOUND")
             api_error(404, "JOB_NOT_FOUND", f"Unknown job_id: {job_id}")
         except ValueError as e:
+            _set_log_fields(request, result="INVALID_STATE")
             api_error(400, "INVALID_STATE", str(e))
         
         # worked & return job_id shown as COMPLETED
+        _set_log_fields(request, result="OK")
         return {"job_id": job_id, "status": s.status(job_id)}
     
 # return status of job_id
