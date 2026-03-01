@@ -14,6 +14,8 @@ PIP := $(PY) -m pip
 APP  ?= server:app
 HOST ?= 0.0.0.0
 PORT ?= 8080
+ENV_FILE ?= .env
+LOAD_ENV = set -a; [ -f "$(ENV_FILE)" ] && . "$(ENV_FILE)"; set +a;
 
 .PHONY: help
 help:
@@ -52,19 +54,23 @@ install: venv
 
 .PHONY: test
 test:
-	@$(PY) -m unittest discover -v -s . -p "test_*.py"
+	@$(LOAD_ENV) \
+	$(PY) -m unittest discover -v -s . -p "test_*.py"
 
 .PHONY: api-test
 api-test:
-	@$(PY) -m unittest -v tests.test_api
+	@$(LOAD_ENV) \
+	$(PY) -m unittest -v tests.test_api
 
 .PHONY: sched-test
 sched-test:
-	@$(PY) -m unittest -v tests.test_scheduler
+	@$(LOAD_ENV) \
+	$(PY) -m unittest -v tests.test_scheduler
 
 .PHONY: smoke
 smoke:
 	@set -euo pipefail; \
+	  $(LOAD_ENV) \
 	  host=127.0.0.1; \
 	  port=$${PORT:-8080}; \
 	  echo "Starting server for smoke test on $$host:$$port..."; \
@@ -91,7 +97,8 @@ ci:
 
 .PHONY: run
 run:
-	@$(PY) -m uvicorn $(APP) --host $(HOST) --port $${PORT:-$(PORT)}
+	@$(LOAD_ENV) \
+	$(PY) -m uvicorn $(APP) --host $(HOST) --port $${PORT:-$(PORT)}
 
 .PHONY: clean
 clean:
