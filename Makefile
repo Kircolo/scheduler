@@ -13,7 +13,7 @@ PIP := $(PY) -m pip
 
 APP  ?= server:app
 HOST ?= 0.0.0.0
-PORT ?= 8000
+PORT ?= 8080
 
 .PHONY: help
 help:
@@ -66,7 +66,7 @@ sched-test:
 smoke:
 	@set -euo pipefail; \
 	  host=127.0.0.1; \
-	  port=$${PORT:-8000}; \
+	  port=$${PORT:-8080}; \
 	  echo "Starting server for smoke test on $$host:$$port..."; \
 	  $(PY) -m uvicorn $(APP) --host $$host --port $$port --log-level warning & \
 	  pid=$$!; \
@@ -91,7 +91,7 @@ ci:
 
 .PHONY: run
 run:
-	@$(PY) -m uvicorn $(APP) --host $(HOST) --port $(PORT)
+	@$(PY) -m uvicorn $(APP) --host $(HOST) --port $${PORT:-$(PORT)}
 
 .PHONY: clean
 clean:
